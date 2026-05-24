@@ -1,27 +1,31 @@
 """
 SMQ_RS — Sistema de Monitoramento de Qualidade RS
-Aplicação Streamlit que serve o dashboard interativo de RNCs.
-
-Deploy: streamlit run app.py
-GitHub: https://github.com/seu-usuario/smq_rs
+streamlit run app.py
 """
 
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-import json
+import json, re, warnings, base64
 from datetime import datetime
 from pathlib import Path
+from io import BytesIO
 
-# ── Configuração da página ────────────────────────────────────────────────────
+# ── Caminhos ──────────────────────────────────────────────────────────────────
+BASE_DIR   = Path(__file__).parent
+HTML_FILE  = BASE_DIR / "dashboard_rnc.html"
+DATA_DIR   = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+LOCAL_JSON = DATA_DIR / "dados_salvos.json"
+LOCAL_META = DATA_DIR / "meta.json"
+
+# ── Página ────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="SMQ_RS — Monitoramento de Qualidade",
     page_icon="🔵",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-
-# Ocultar elementos padrão do Streamlit para visual limpo
 st.markdown("""
 <style>
   #MainMenu, footer, header { visibility: hidden; }
@@ -30,173 +34,218 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Carregar HTML do dashboard ────────────────────────────────────────────────
-HTML_FILE = Path(__file__).parent / "dashboard_rnc.html"
 
-def load_dashboard_html() -> str:
-    """Lê o HTML do dashboard. Suporta injeção de dados via upload."""
-    return HTML_FILE.read_text(encoding="utf-8")
+# ══════════════════════════════════════════════════════════════════════════════
+# CONVERSÃO XLSX → JSON
+# ══════════════════════════════════════════════════════════════════════════════
 
-def excel_to_json(file_bytes: bytes) -> str | None:
-    """
-    Converte bytes de um .xlsx para JSON no mesmo formato
-    esperado pelo dashboard (lista de dicts).
-    Retorna None se houver erro.
-    """
+def xlsx_para_json(file_bytes: bytes) -> tuple[str | None, int, str]:
     try:
-        df = pd.read_excel(file_bytes, engine="openpyxl")
+        df = pd.read_excel(BytesIO(file_bytes), engine="openpyxl")
         df.columns = [str(c).strip() for c in df.columns]
 
-        # Mapear colunas pelo nome (case-insensitive, busca parcial)
-        def find_col(keywords):
-            for kw in keywords:
-                for col in df.columns:
-                    if kw.lower() in col.lower():
-                        return col
+        def col(palavras):
+            for p in palavras:
+                for c in df.columns:
+                    if p.lower() in c.lower():
+                        return c
             return None
 
-        col_cod   = find_col(["código", "codigo"])
-        col_tit   = find_col(["título", "titulo"])
-        col_st    = find_col(["status"])
-        col_sit   = find_col(["situação", "situacao"])
-        col_dt    = find_col(["emissão", "emissao", "data"])
-        col_rsp   = find_col(["responsável", "responsavel"])
-        col_cli   = find_col(["cliente"])
-        col_rca   = find_col(["análise de causa", "analise de causa"])
-        col_mot   = find_col(["motivo"])
-        col_qtd   = find_col(["quantidade"])
-        col_trn   = find_col(["turno"])
+        c_cod = col(["código","codigo"])
+        c_tit = col(["título","titulo"])
+        c_st  = col(["status"])
+        c_sit = col(["situação","situacao"])
+        c_dt  = col(["emissão","emissao","data"])
+        c_rsp = col(["responsável","responsavel"])
+        c_cli = col(["cliente"])
+        c_rca = col(["análise de causa","analise de causa"])
+        c_mot = col(["motivo"])
+        c_qtd = col(["quantidade"])
+        c_trn = col(["turno"])
 
-        records = []
+        if not c_cod:
+            return None, 0, f"Coluna 'Código' não encontrada. Colunas: {', '.join(df.columns.tolist())}"
+
+        registros = []
         for _, row in df.iterrows():
-            cod = str(row.get(col_cod, "")) if col_cod else ""
+            cod = str(row.get(c_cod, "")).strip()
             if not cod or cod == "nan":
                 continue
 
-            # Data
-            dt_val = row.get(col_dt) if col_dt else None
             dt_str, ano, mes = "", None, None
-            if pd.notna(dt_val):
-                if isinstance(dt_val, (datetime, pd.Timestamp)):
-                    dt = pd.Timestamp(dt_val)
+            dv = row.get(c_dt) if c_dt else None
+            if pd.notna(dv):
+                try:
+                    dt = pd.Timestamp(dv)
                     dt_str = dt.strftime("%Y-%m-%d")
-                    ano, mes = dt.year, dt.month
-                elif isinstance(dt_val, str):
-                    try:
-                        dt = pd.to_datetime(dt_val)
-                        dt_str = dt.strftime("%Y-%m-%d")
-                        ano, mes = dt.year, dt.month
-                    except Exception:
-                        pass
+                    ano, mes = int(dt.year), int(dt.month)
+                except Exception:
+                    pass
 
-            # Turno
-            trn_raw = str(row.get(col_trn, "")) if col_trn else ""
-            if "1" in trn_raw and "2" in trn_raw and "3" in trn_raw:
+            trn = str(row.get(c_trn, "")) if c_trn else ""
+            if "1" in trn and "2" in trn and "3" in trn:
                 turno = "Múltiplos Turnos"
-            elif "1" in trn_raw:
-                turno = "1° Turno"
-            elif "2" in trn_raw:
-                turno = "2° Turno"
-            elif "3" in trn_raw:
-                turno = "3° Turno"
-            else:
-                turno = "Não Informado"
+            elif "1" in trn: turno = "1° Turno"
+            elif "2" in trn: turno = "2° Turno"
+            elif "3" in trn: turno = "3° Turno"
+            else:            turno = "Não Informado"
 
-            def safe(col):
-                v = row.get(col) if col else None
+            def safe(c):
+                if not c: return ""
+                v = row.get(c)
                 return str(v).strip() if pd.notna(v) and str(v) != "nan" else ""
 
-            records.append({
-                "codigo":            cod,
-                "titulo":            safe(col_tit),
-                "status":            safe(col_st),
-                "situacao":          safe(col_sit),
-                "data":              dt_str,
-                "ano":               ano,
-                "mes":               mes,
-                "responsavel":       safe(col_rsp),
-                "cliente":           safe(col_cli),
-                "responsavel_causa": safe(col_rca),
-                "motivo":            safe(col_mot),
-                "qtd":               safe(col_qtd),
-                "turno":             turno,
+            registros.append({
+                "codigo": cod,            "titulo": safe(c_tit),
+                "status": safe(c_st),     "situacao": safe(c_sit),
+                "data": dt_str,           "ano": ano,  "mes": mes,
+                "responsavel": safe(c_rsp),
+                "cliente": safe(c_cli),
+                "responsavel_causa": safe(c_rca),
+                "motivo": safe(c_mot),    "qtd": safe(c_qtd),
+                "turno": turno,
             })
 
-        return json.dumps(records, ensure_ascii=False)
+        if not registros:
+            return None, 0, "Nenhum registro encontrado."
+
+        return json.dumps(registros, ensure_ascii=False), len(registros), ""
+
     except Exception as e:
-        st.error(f"Erro ao processar planilha: {e}")
-        return None
+        return None, 0, f"Erro ao ler planilha: {e}"
 
 
-def inject_new_data(html: str, json_data: str, update_ts: str) -> str:
-    """
-    Substitui os dados embutidos no HTML pelo novo JSON
-    e atualiza o texto de última atualização.
-    """
-    import re
+# ══════════════════════════════════════════════════════════════════════════════
+# PERSISTÊNCIA
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Substituir RAW_DATA
-    html = re.sub(
-        r"const RAW_DATA = \[.*?\];",
-        f"const RAW_DATA = {json_data};",
-        html,
-        flags=re.DOTALL,
+def salvar_disco(json_str: str, ts: str, n: int) -> None:
+    LOCAL_JSON.write_text(json_str, encoding="utf-8")
+    LOCAL_META.write_text(
+        json.dumps({"timestamp": ts, "n_records": n}),
+        encoding="utf-8",
     )
 
-    # Atualizar texto de última atualização no data-update
-    n = json_data.count('"codigo"')
-    html = html.replace(
-        "341 registros carregados",
-        f"{n} registros carregados",
-    )
-    html = html.replace(
-        "Base original · jan/2025–mai/2026",
-        f"Atualizado em {update_ts}",
-    )
+def carregar_disco() -> tuple[str | None, str, int]:
+    if LOCAL_JSON.exists() and LOCAL_META.exists():
+        try:
+            j    = LOCAL_JSON.read_text(encoding="utf-8")
+            meta = json.loads(LOCAL_META.read_text(encoding="utf-8"))
+            return j, meta.get("timestamp", "—"), int(meta.get("n_records", 0))
+        except Exception:
+            pass
+    return None, "", 0
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MONTAR HTML
+# ══════════════════════════════════════════════════════════════════════════════
+
+_RE = re.compile(r"const RAW_DATA = \[.*?\];", re.DOTALL)
+
+def montar_html(json_str: str | None, ts: str, n: int) -> str:
+    html = HTML_FILE.read_text(encoding="utf-8")
+    if json_str:
+        html = _RE.sub(f"const RAW_DATA = {json_str};", html)
+        html = re.sub(r"\d+ registros carregados", f"{n} registros carregados", html)
+        html = re.sub(
+            r"(Base original[^<\"]*|Atualizado em [^<\"]*)",
+            f"Atualizado em {ts}",
+            html,
+        )
     return html
 
 
-# ── Interface ─────────────────────────────────────────────────────────────────
-# Sidebar: upload de nova planilha
+def render_html(html: str, height: int = 980) -> None:
+    """
+    Renderiza HTML inline de forma compatível com versões novas do Streamlit.
+    Usa iframe com data URI base64 — sem depender de components.html.
+    """
+    b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+    iframe = f"""
+    <iframe
+        src="data:text/html;base64,{b64}"
+        width="100%"
+        height="{height}px"
+        frameborder="0"
+        style="border:none;display:block;"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads"
+    ></iframe>
+    """
+    st.markdown(iframe, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INICIALIZAÇÃO
+# ══════════════════════════════════════════════════════════════════════════════
+
+if "dados" not in st.session_state:
+    j, ts, n = carregar_disco()
+    st.session_state["dados"] = j
+    st.session_state["ts"]    = ts
+    st.session_state["n"]     = n
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+
 with st.sidebar:
-    st.markdown("## SMQ_RS")
-    st.markdown("Sistema de Monitoramento de Qualidade")
+    st.markdown("## 🔵 SMQ_RS")
+    st.caption("Sistema de Monitoramento de Qualidade")
     st.divider()
-    st.markdown("### 📂 Atualizar Dados")
-    uploaded = st.file_uploader(
-        "Envie uma planilha .xlsx",
-        type=["xlsx", "xls"],
-        help="Mesmo formato da planilha de referência (Consultas_RNC_APP.xlsx)",
-    )
-    if uploaded:
-        with st.spinner("Processando planilha..."):
-            json_data = excel_to_json(uploaded.read())
-        if json_data:
-            n = json_data.count('"codigo"')
-            ts = datetime.now().strftime("%d/%m/%Y às %H:%M")
-            st.success(f"✅ {n} registros carregados\n\n🕐 {ts}")
-            st.session_state["json_data"] = json_data
-            st.session_state["update_ts"] = ts
-            st.session_state["n_records"] = n
+
+    if st.session_state["dados"]:
+        st.success("✅ Dados carregados")
+        st.caption(f"🕐 {st.session_state['ts']}")
+        st.caption(f"📋 {st.session_state['n']:,} registros")
+    else:
+        st.info("📋 Usando dados originais do sistema")
 
     st.divider()
-    st.markdown("### ℹ️ Sobre")
-    st.caption("SMQ_RS v1.0 — Dashboard interativo de RNCs. Desenvolvido com Streamlit + Chart.js.")
+    st.markdown("### 📂 Atualizar Planilha")
 
-    if "update_ts" in st.session_state:
-        st.markdown(f"**Última atualização:** {st.session_state['update_ts']}")
-        st.markdown(f"**Registros:** {st.session_state.get('n_records', '—')}")
+    arquivo = st.file_uploader("Selecione o arquivo .xlsx", type=["xlsx","xls"])
 
-# Montar HTML final
-html_content = load_dashboard_html()
+    if arquivo:
+        if st.button("⬆️ Salvar Planilha", type="primary", use_container_width=True):
+            with st.spinner("Processando..."):
+                j, n, erro = xlsx_para_json(arquivo.read())
 
-if "json_data" in st.session_state:
-    html_content = inject_new_data(
-        html_content,
-        st.session_state["json_data"],
-        st.session_state.get("update_ts", "—"),
-    )
+            if not j:
+                st.error(f"❌ {erro}")
+            else:
+                ts = datetime.now().strftime("%d/%m/%Y às %H:%M")
+                try:
+                    salvar_disco(j, ts, n)
+                    st.session_state["dados"] = j
+                    st.session_state["ts"]    = ts
+                    st.session_state["n"]     = n
+                    st.success(f"✅ {n:,} registros salvos!\n\n🕐 {ts}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Erro ao salvar: {e}")
 
-# Renderizar dashboard completo
-components.html(html_content, height=960, scrolling=True)
+    st.divider()
+
+    if LOCAL_JSON.exists():
+        if st.button("🗑️ Limpar dados salvos", type="secondary"):
+            LOCAL_JSON.unlink(missing_ok=True)
+            LOCAL_META.unlink(missing_ok=True)
+            st.session_state.update({"dados": None, "ts": "", "n": 0})
+            st.rerun()
+
+    st.caption("SMQ_RS v1.5 · Streamlit + Chart.js")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+html_final = montar_html(
+    st.session_state.get("dados"),
+    st.session_state.get("ts", ""),
+    st.session_state.get("n", 0),
+)
+
+render_html(html_final, height=980)
