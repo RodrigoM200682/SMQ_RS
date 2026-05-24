@@ -1,6 +1,6 @@
 # SMQ_RS — Sistema de Monitoramento de Qualidade RS
 
-Dashboard interativo para monitoramento de RNCs (Registros de Não Conformidade) e reclamações de clientes.
+Dashboard interativo para monitoramento de RNCs (Registros de Não Conformidade).
 
 ---
 
@@ -8,126 +8,122 @@ Dashboard interativo para monitoramento de RNCs (Registros de Não Conformidade)
 
 ```
 smq_rs/
-├── app.py                  # Aplicação Streamlit principal
-├── dashboard_rnc.html      # Dashboard interativo (Chart.js + lógica JS)
-├── requirements.txt        # Dependências Python
+├── app.py                          # Aplicação Streamlit
+├── dashboard_rnc.html              # Dashboard completo (Chart.js)
+├── requirements.txt                # Dependências Python
+├── .streamlit/
+│   └── secrets.toml.example       # Modelo de configuração
+├── data/
+│   └── .gitkeep                   # Pasta versionada (dados não commitados)
 └── README.md
 ```
 
 ---
 
-## 🚀 Executar localmente
+## 🚀 Instalação local
 
-### 1. Clone o repositório
 ```bash
 git clone https://github.com/seu-usuario/smq_rs.git
 cd smq_rs
-```
-
-### 2. Crie um ambiente virtual (recomendado)
-```bash
 python -m venv venv
-source venv/bin/activate        # Linux/Mac
-venv\Scripts\activate           # Windows
-```
-
-### 3. Instale as dependências
-```bash
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-### 4. Execute
-```bash
 streamlit run app.py
 ```
 
-Acesse em: `http://localhost:8501`
+Acesse em `http://localhost:8501`
 
 ---
 
-## ☁️ Deploy no Streamlit Cloud
+## ☁️ Deploy no Streamlit Cloud (com persistência real)
 
-1. Faça fork/push do repositório para o GitHub
-2. Acesse [share.streamlit.io](https://share.streamlit.io)
-3. Clique em **New app**
-4. Selecione o repositório e o arquivo `app.py`
-5. Clique em **Deploy**
+### Passo 1 — Subir para o GitHub
 
-> O Streamlit Cloud instala automaticamente as dependências do `requirements.txt`.
+```bash
+git init
+git add .
+git commit -m "SMQ_RS v1.2"
+git remote add origin https://github.com/seu-usuario/smq_rs.git
+git push -u origin main
+```
+
+### Passo 2 — Criar Personal Access Token no GitHub
+
+1. Acesse: https://github.com/settings/tokens
+2. **Generate new token (classic)**
+3. Nome: `SMQ_RS`
+4. Escopo: marque apenas **`repo`** (Contents read & write)
+5. Copie o token gerado (`ghp_...`)
+
+### Passo 3 — Deploy no Streamlit Cloud
+
+1. Acesse https://share.streamlit.io → **New app**
+2. Selecione o repositório e o arquivo `app.py`
+3. Clique em **Advanced settings → Secrets** e cole:
+
+```toml
+[github]
+token  = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+repo   = "seu-usuario/smq_rs"
+branch = "main"
+```
+
+4. Clique em **Deploy**
+
+### Como funciona a persistência
+
+```
+Upload de planilha
+      │
+      ▼
+Converte XLSX → JSON
+      │
+      ├─► Salva em data/ (cache local)
+      │
+      └─► PUT /repos/{repo}/contents/data/dados_salvos.json
+                    (GitHub API — persiste entre deploys)
+
+Reinício do app
+      │
+      ▼
+GET /repos/{repo}/contents/data/dados_salvos.json
+      │                                          │
+   Encontrou ──────────────────────────────────► Carrega dados
+      │
+   Não encontrou → usa cache local → usa dados originais
+```
+
+Os dados ficam salvos **no próprio repositório GitHub** como arquivos JSON. Isso garante que qualquer reinício, redeploy ou novo usuário sempre carregue a versão mais recente da planilha.
 
 ---
 
-## 📊 Funcionalidades
+## 📊 Abas do dashboard
 
 | Aba | Descrição |
 |-----|-----------|
-| **Visão Geral** | Totais da base completa · RNCs em atraso · Pizzas por status e turno |
-| **Por Período** | KPIs + gráficos filtrados por período, status, cliente, motivo, turno e responsável |
-| **Comparação** | Dois intervalos de meses lado a lado — motivos, turnos e evolução mensal |
-| **Por Responsável** | Ranking de analistas · Top motivos por responsável |
-| **Registros** | Tabela completa com múltipla seleção de filtros |
-
-### Filtros globais
-- Período (de/até)
-- Status (múltipla seleção)
-- Turno (múltipla seleção)
-- Cliente (múltipla seleção)
-- Motivo (múltipla seleção)
-- Responsável de análise
-
-### Outras funcionalidades
-- **Recolher filtro** — expande/colapsa a barra de filtros
-- **Baixar Relatório PDF** — exporta o painel ativo com data da consulta
-- **Atualizar Planilha** — via sidebar (Streamlit) ou botão no dashboard
-
----
-
-## 📋 Formato da planilha
-
-O sistema lê arquivos `.xlsx` com as seguintes colunas (nome aproximado):
-
-| Coluna | Descrição |
-|--------|-----------|
-| Código | Identificador único da RNC |
-| Título | Descrição resumida |
-| Status | Aberta / Concluída / Reprovada / Associada / Cancelada |
-| Situação | No prazo / Atrasada / Fechada no prazo / Fechada atrasada |
-| Data de emissão | Data de abertura da RNC |
-| Responsável | Responsável pelo registro |
-| Cliente | Nome do cliente |
-| Responsável da análise de causa | Analista responsável |
-| Motivo Reclamação | Tipo de defeito/motivo |
-| Quantidade não conforme | Quantidade afetada |
-| Turno/Horário | 1° / 2° / 3° Turno |
+| **Visão Geral** | Totais completos · RNCs em atraso · Gráficos de pizza |
+| **Por Período** | KPIs + gráficos com todos os filtros |
+| **Comparação** | Dois intervalos de meses lado a lado |
+| **Por Responsável** | Ranking de analistas + top motivos |
+| **Registros** | Tabela completa com múltipla seleção |
 
 ---
 
 ## 🔧 Tecnologias
 
-- **Python** — Streamlit, Pandas, OpenPyXL
+- **Python** — Streamlit 1.35+, Pandas, OpenPyXL
 - **JavaScript** — Chart.js 4.4.1, XLSX.js
-- **Fontes** — IBM Plex Sans / IBM Plex Mono
+- **Persistência** — GitHub API (REST v3)
 
 ---
 
-## 📄 Licença
+## ❓ Troubleshooting
 
-MIT — uso livre para fins internos e comerciais.
+**Dados não persistem após redeploy**
+→ Verifique se o token está configurado em Secrets e tem escopo `repo`.
 
----
+**Erro 401/403 na sidebar**
+→ Token expirado ou sem permissão. Gere um novo em github.com/settings/tokens.
 
-## 💾 Persistência de dados
-
-Ao enviar uma nova planilha via sidebar, o sistema salva automaticamente:
-
-```
-data/
-├── dados_salvos.json   ← registros convertidos da última planilha
-└── meta.json           ← timestamp e contagem de registros
-```
-
-**A cada reinício**, o app carrega automaticamente esses arquivos — sem necessidade de reenviar a planilha.
-
-Para voltar à base original, use o botão **"Limpar dados salvos"** na sidebar.
-
-> **Nota Streamlit Cloud:** o sistema de arquivos do Streamlit Cloud é efêmero (reinicia ao fazer novo deploy). Para persistência permanente em produção, recomenda-se substituir `DATA_FILE` por um bucket S3, Google Cloud Storage ou banco de dados externo. Localmente e em servidores próprios, a persistência em arquivo funciona normalmente.
+**Planilha não lida corretamente**
+→ Confirme que as colunas seguem o modelo da planilha de referência (Consultas_RNC_APP.xlsx).

@@ -1,13 +1,19 @@
 """
 SMQ_RS — Sistema de Monitoramento de Qualidade RS
-Aplicação Streamlit que serve o dashboard interativo de RNCs.
 
-Persistência: os dados da última planilha carregada são salvos em
-data/dados_salvos.json e data/meta.json — carregados automaticamente
-a cada reinício da aplicação.
+Persistência via GitHub API:
+  - Ao fazer upload de uma planilha, os dados são salvos como
+    data/dados_salvos.json diretamente no repositório GitHub.
+  - A cada reinício, o app lê esse arquivo do GitHub — garantindo
+    persistência real mesmo no Streamlit Cloud (filesystem efêmero).
 
-Deploy: streamlit run app.py
-GitHub: https://github.com/seu-usuario/smq_rs
+Configuração necessária (Streamlit Secrets):
+  [github]
+  token = "ghp_xxxxxxxxxxxxxxxxxxxx"   # Personal Access Token (repo scope)
+  repo  = "seu-usuario/smq_rs"         # repositório no formato usuario/repo
+  branch = "main"                      # branch onde salvar (padrão: main)
+
+Deploy local: streamlit run app.py
 """
 
 import streamlit as st
@@ -15,17 +21,26 @@ import streamlit.components.v1 as components
 import pandas as pd
 import json
 import re
+import base64
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
+from io import BytesIO
 
 # ── Caminhos ──────────────────────────────────────────────────────────────────
-BASE_DIR   = Path(__file__).parent
-HTML_FILE  = BASE_DIR / "dashboard_rnc.html"
-DATA_DIR   = BASE_DIR / "data"
-DATA_FILE  = DATA_DIR / "dados_salvos.json"   # registros em JSON
-META_FILE  = DATA_DIR / "meta.json"           # timestamp + contagem
-
+BASE_DIR  = Path(__file__).parent
+HTML_FILE = BASE_DIR / "dashboard_rnc.html"
+DATA_DIR  = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+
+# Arquivo local (cache / uso sem GitHub)
+LOCAL_DATA = DATA_DIR / "dados_salvos.json"
+LOCAL_META = DATA_DIR / "meta.json"
+
+# Caminho no repositório GitHub
+GITHUB_DATA_PATH = "data/dados_salvos.json"
+GITHUB_META_PATH = "data/meta.json"
 
 # ── Configuração da página ────────────────────────────────────────────────────
 st.set_page_config(
@@ -44,43 +59,161 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ── GitHub API ────────────────────────────────────────────────────────────────
+
+def _gh_secrets() -> tuple[str, str, str] | tuple[None, None, None]:
+    """Retorna (token, repo, branch) dos secrets, ou (None,None,None)."""
+    try:
+        token  = st.secrets["github"]["token"]
+        repo   = st.secrets["github"]["repo"]
+        branch = st.secrets["github"].get("branch", "main")
+        if token and repo:
+            return token, repo, branch
+    except Exception:
+        pass
+    return None, None, None
+
+
+def _gh_get(path: str) -> dict | None:
+    """GET /repos/{repo}/contents/{path} — retorna JSON ou None."""
+    token, repo, branch = _gh_secrets()
+    if not token:
+        return None
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "SMQ_RS",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None          # arquivo ainda não existe
+        raise
+    except Exception:
+        return None
+
+
+def _gh_put(path: str, content: str, message: str) -> bool:
+    """
+    Cria ou atualiza um arquivo no GitHub via PUT.
+    content deve ser string UTF-8 (será codificada em base64).
+    Retorna True se sucesso.
+    """
+    token, repo, branch = _gh_secrets()
+    if not token:
+        return False
+
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+
+    # Buscar SHA atual (necessário para atualizar arquivo existente)
+    existing = _gh_get(path)
+    sha = existing.get("sha") if existing else None
+
+    payload: dict = {
+        "message": message,
+        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch":  branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="PUT", headers={
+        "Authorization": f"token {token}",
+        "Accept":        "application/vnd.github.v3+json",
+        "Content-Type":  "application/json",
+        "User-Agent":    "SMQ_RS",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            return True
+    except Exception as e:
+        st.warning(f"GitHub: não foi possível salvar ({e}). Dados salvos apenas localmente.")
+        return False
+
+
+def _gh_read(path: str) -> str | None:
+    """Lê conteúdo de um arquivo do GitHub e retorna como string."""
+    info = _gh_get(path)
+    if not info:
+        return None
+    try:
+        return base64.b64decode(info["content"]).decode("utf-8")
+    except Exception:
+        return None
+
+
 # ── Persistência ──────────────────────────────────────────────────────────────
 
 def save_data(json_str: str, ts: str, n: int) -> None:
-    """Grava os dados e metadados em disco."""
-    DATA_FILE.write_text(json_str, encoding="utf-8")
-    META_FILE.write_text(
-        json.dumps({"timestamp": ts, "n_records": n}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    """
+    Salva dados:
+      1. Localmente (sempre, como cache imediato)
+      2. No GitHub (se configurado) — garante persistência no Streamlit Cloud
+    """
+    meta_str = json.dumps({"timestamp": ts, "n_records": n}, ensure_ascii=False)
+
+    # 1. Local
+    LOCAL_DATA.write_text(json_str, encoding="utf-8")
+    LOCAL_META.write_text(meta_str, encoding="utf-8")
+
+    # 2. GitHub
+    token, _, _ = _gh_secrets()
+    if token:
+        ts_commit = datetime.now().strftime("%Y-%m-%d %H:%M")
+        ok_data = _gh_put(GITHUB_DATA_PATH, json_str,
+                          f"SMQ_RS: atualização de dados ({n} registros) — {ts_commit}")
+        ok_meta = _gh_put(GITHUB_META_PATH, meta_str,
+                          f"SMQ_RS: meta atualização — {ts_commit}")
+        if ok_data and ok_meta:
+            st.toast("✅ Dados sincronizados com GitHub", icon="☁️")
+
 
 def load_saved_data() -> tuple[str | None, str | None, int]:
     """
-    Lê dados salvos em disco.
-    Retorna (json_str, timestamp, n_records) ou (None, None, 0) se não houver.
+    Carrega dados persistidos.
+    Prioridade: GitHub (sempre atualizado) → local → None
     """
-    if DATA_FILE.exists() and META_FILE.exists():
+    token, _, _ = _gh_secrets()
+
+    if token:
+        # Tentar carregar do GitHub primeiro
+        json_str = _gh_read(GITHUB_DATA_PATH)
+        meta_str = _gh_read(GITHUB_META_PATH)
+        if json_str and meta_str:
+            try:
+                meta = json.loads(meta_str)
+                # Atualizar cache local com dados do GitHub
+                LOCAL_DATA.write_text(json_str, encoding="utf-8")
+                LOCAL_META.write_text(meta_str, encoding="utf-8")
+                return json_str, meta.get("timestamp", "—"), meta.get("n_records", 0)
+            except Exception:
+                pass
+
+    # Fallback: arquivo local
+    if LOCAL_DATA.exists() and LOCAL_META.exists():
         try:
-            json_str = DATA_FILE.read_text(encoding="utf-8")
-            meta     = json.loads(META_FILE.read_text(encoding="utf-8"))
+            json_str = LOCAL_DATA.read_text(encoding="utf-8")
+            meta     = json.loads(LOCAL_META.read_text(encoding="utf-8"))
             return json_str, meta.get("timestamp", "—"), meta.get("n_records", 0)
         except Exception:
             pass
+
     return None, None, 0
 
 
 # ── Conversão de planilha ─────────────────────────────────────────────────────
 
 def excel_to_json(file_bytes: bytes) -> str | None:
-    """
-    Converte bytes de um .xlsx para JSON no formato esperado pelo dashboard.
-    Retorna None se houver erro.
-    """
+    """Converte bytes de .xlsx para JSON no formato do dashboard."""
     try:
-        df = pd.read_excel(file_bytes, engine="openpyxl")
+        df = pd.read_excel(BytesIO(file_bytes), engine="openpyxl")
         df.columns = [str(c).strip() for c in df.columns]
 
-        def find_col(keywords: list[str]) -> str | None:
+        def find_col(keywords: list) -> str | None:
             for kw in keywords:
                 for col in df.columns:
                     if kw.lower() in col.lower():
@@ -118,19 +251,18 @@ def excel_to_json(file_bytes: bytes) -> str | None:
 
             # Turno
             trn_raw = str(row.get(col_trn, "")) if col_trn else ""
-            has = lambda n: str(n) in trn_raw
-            if has(1) and has(2) and has(3):
+            if "1" in trn_raw and "2" in trn_raw and "3" in trn_raw:
                 turno = "Múltiplos Turnos"
-            elif has(1):
+            elif "1" in trn_raw:
                 turno = "1° Turno"
-            elif has(2):
+            elif "2" in trn_raw:
                 turno = "2° Turno"
-            elif has(3):
+            elif "3" in trn_raw:
                 turno = "3° Turno"
             else:
                 turno = "Não Informado"
 
-            def safe(col: str | None) -> str:
+            def safe(col):
                 if not col:
                     return ""
                 v = row.get(col)
@@ -164,16 +296,8 @@ def excel_to_json(file_bytes: bytes) -> str | None:
 _RAW_DATA_RE = re.compile(r"const RAW_DATA = \[.*?\];", re.DOTALL)
 
 def inject_data(html: str, json_str: str, ts: str, n: int) -> str:
-    """Substitui RAW_DATA e textos de status no HTML."""
     html = _RAW_DATA_RE.sub(f"const RAW_DATA = {json_str};", html)
-
-    # Contagem de registros — substitui qualquer número antes de " registros carregados"
-    html = re.sub(
-        r'\d+ registros carregados',
-        f'{n} registros carregados',
-        html,
-    )
-    # Texto de última atualização
+    html = re.sub(r'\d+ registros carregados', f'{n} registros carregados', html)
     html = re.sub(
         r'(Base original[^<"]*|Atualizado em [^<"]*)',
         f'Atualizado em {ts}',
@@ -181,19 +305,21 @@ def inject_data(html: str, json_str: str, ts: str, n: int) -> str:
     )
     return html
 
+
 def load_html() -> str:
     return HTML_FILE.read_text(encoding="utf-8")
 
 
-# ── Inicialização — carregar dados salvos em disco ────────────────────────────
+# ── Inicialização — carregar dados persistidos ────────────────────────────────
 
 if "initialized" not in st.session_state:
-    json_str, ts, n = load_saved_data()
+    with st.spinner("Carregando dados..."):
+        json_str, ts, n = load_saved_data()
     if json_str:
-        st.session_state["json_data"]  = json_str
-        st.session_state["update_ts"]  = ts
-        st.session_state["n_records"]  = n
-        st.session_state["from_disk"]  = True
+        st.session_state["json_data"] = json_str
+        st.session_state["update_ts"] = ts
+        st.session_state["n_records"] = n
+        st.session_state["from_gh"]   = bool(_gh_secrets()[0])
     st.session_state["initialized"] = True
 
 
@@ -201,23 +327,34 @@ if "initialized" not in st.session_state:
 
 with st.sidebar:
     st.markdown("## 🔵 SMQ_RS")
-    st.markdown("Sistema de Monitoramento de Qualidade")
+    st.caption("Sistema de Monitoramento de Qualidade")
     st.divider()
 
-    # Status da base atual
+    # Status da base
     if "update_ts" in st.session_state:
-        origem = "💾 Dados salvos em disco" if st.session_state.get("from_disk") else "📤 Dados do upload atual"
-        st.markdown(f"**{origem}**")
-        st.markdown(f"🕐 {st.session_state['update_ts']}")
-        st.markdown(f"📋 {st.session_state.get('n_records', 0):,} registros")
-        st.divider()
+        origem = "☁️ GitHub (sincronizado)" if st.session_state.get("from_gh") else "💾 Cache local"
+        st.success(f"**Base carregada**\n\n{origem}")
+        st.markdown(f"🕐 **Atualizado em:** {st.session_state['update_ts']}")
+        st.markdown(f"📋 **Registros:** {st.session_state.get('n_records', 0):,}")
     else:
-        st.info("Usando dados originais embutidos no sistema.")
-        st.divider()
+        st.info("Usando dados originais do sistema.")
 
+    st.divider()
+
+    # GitHub status
+    token, repo, branch = _gh_secrets()
+    if token:
+        st.success(f"☁️ **GitHub conectado**\n\n`{repo}` · branch `{branch}`")
+    else:
+        st.warning(
+            "⚠️ **GitHub não configurado**\n\n"
+            "Persistência apenas local (perdida ao reiniciar no Streamlit Cloud).\n\n"
+            "Configure em **Settings → Secrets**:\n"
+            "```toml\n[github]\ntoken = \"ghp_...\"\nrepo  = \"usuario/smq_rs\"\nbranch = \"main\"\n```"
+        )
+
+    st.divider()
     st.markdown("### 📂 Atualizar Planilha")
-    st.caption("Ao enviar uma nova planilha, os dados são salvos permanentemente e carregados automaticamente nos próximos acessos.")
-
     uploaded = st.file_uploader(
         "Selecione o arquivo .xlsx",
         type=["xlsx", "xls"],
@@ -225,43 +362,41 @@ with st.sidebar:
     )
 
     if uploaded:
-        with st.spinner("Processando e salvando planilha..."):
+        with st.spinner("Processando planilha..."):
             json_str = excel_to_json(uploaded.read())
 
         if json_str:
             n  = json_str.count('"codigo"')
             ts = datetime.now().strftime("%d/%m/%Y às %H:%M")
 
-            # Salvar em disco (persistência entre reinícios)
-            save_data(json_str, ts, n)
+            with st.spinner("Salvando dados..."):
+                save_data(json_str, ts, n)
 
-            # Atualizar session_state
             st.session_state["json_data"] = json_str
             st.session_state["update_ts"] = ts
             st.session_state["n_records"] = n
-            st.session_state["from_disk"] = False
+            st.session_state["from_gh"]   = bool(token)
 
-            st.success(f"✅ {n:,} registros salvos com sucesso!\n\n🕐 {ts}")
+            st.success(f"✅ {n:,} registros salvos!\n\n🕐 {ts}")
+            st.rerun()
+
+    # Limpar dados
+    st.divider()
+    if LOCAL_DATA.exists() or token:
+        if st.button("🗑️ Limpar dados salvos", type="secondary"):
+            LOCAL_DATA.unlink(missing_ok=True)
+            LOCAL_META.unlink(missing_ok=True)
+            for k in ["json_data", "update_ts", "n_records", "from_gh"]:
+                st.session_state.pop(k, None)
+            st.session_state["initialized"] = True
+            st.success("Dados removidos. Usando base original.")
             st.rerun()
 
     st.divider()
-
-    # Opção de limpar dados salvos
-    if DATA_FILE.exists():
-        if st.button("🗑️ Limpar dados salvos", type="secondary",
-                     help="Remove os dados persistidos e volta para a base original"):
-            DATA_FILE.unlink(missing_ok=True)
-            META_FILE.unlink(missing_ok=True)
-            for key in ["json_data", "update_ts", "n_records", "from_disk"]:
-                st.session_state.pop(key, None)
-            st.success("Dados salvos removidos. Usando base original.")
-            st.rerun()
-
-    st.divider()
-    st.caption("SMQ_RS v1.1 · Streamlit + Chart.js")
+    st.caption("SMQ_RS v1.2 · Streamlit + Chart.js")
 
 
-# ── Montar e renderizar dashboard ─────────────────────────────────────────────
+# ── Renderizar dashboard ──────────────────────────────────────────────────────
 
 html = load_html()
 
