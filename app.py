@@ -1,12 +1,19 @@
 """
 SMQ_RS — Sistema de Monitoramento de Qualidade RS
-streamlit run app.py
+Persistência via GitHub API.
+
+Secrets (Streamlit Cloud → Settings → Secrets):
+  [github]
+  token  = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  repo   = "seu-usuario/smq_rs"
+  branch = "main"
 """
 
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-import json, re
+import json, re, base64
+import urllib.request, urllib.error
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
@@ -33,6 +40,164 @@ st.markdown("""
   .stApp { background: #0f1117; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GITHUB API
+# ══════════════════════════════════════════════════════════════════════════════
+
+def gh_cfg():
+    """Retorna (token, repo, branch) ou (None, None, None)."""
+    try:
+        token  = str(st.secrets["github"]["token"]).strip()
+        repo   = str(st.secrets["github"]["repo"]).strip()
+        branch = str(st.secrets["github"].get("branch", "main")).strip()
+        if token and repo:
+            return token, repo, branch
+    except Exception:
+        pass
+    return None, None, None
+
+
+def gh_ler(path: str) -> tuple[str | None, str | None]:
+    """
+    Lê arquivo do GitHub.
+    Retorna (conteudo_str, sha) ou (None, None).
+    """
+    token, repo, branch = gh_cfg()
+    if not token:
+        return None, None
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept":        "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent":    "SMQ_RS",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read())
+            conteudo = base64.b64decode(
+                body["content"].replace("\n", "")
+            ).decode("utf-8")
+            return conteudo, body.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None   # arquivo ainda não existe
+        return None, None
+    except Exception:
+        return None, None
+
+
+def gh_salvar(path: str, conteudo: str, mensagem: str) -> bool:
+    """
+    Cria ou atualiza arquivo no GitHub.
+    Retorna True se sucesso.
+    """
+    token, repo, branch = gh_cfg()
+    if not token:
+        return False
+
+    _, sha = gh_ler(path)   # pega SHA para update
+
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {
+        "message": mensagem,
+        "content": base64.b64encode(conteudo.encode("utf-8")).decode("ascii"),
+        "branch":  branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    data = json.dumps(payload).encode()
+    req  = urllib.request.Request(url, data=data, method="PUT", headers={
+        "Authorization": f"Bearer {token}",
+        "Accept":        "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type":  "application/json",
+        "User-Agent":    "SMQ_RS",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status in (200, 201)
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PERSISTÊNCIA LOCAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def salvar_local(json_str: str, ts: str, n: int) -> None:
+    LOCAL_JSON.write_text(json_str, encoding="utf-8")
+    LOCAL_META.write_text(
+        json.dumps({"timestamp": ts, "n_records": n}),
+        encoding="utf-8",
+    )
+
+
+def carregar_local() -> tuple[str | None, str, int]:
+    if LOCAL_JSON.exists() and LOCAL_META.exists():
+        try:
+            j    = LOCAL_JSON.read_text(encoding="utf-8")
+            meta = json.loads(LOCAL_META.read_text(encoding="utf-8"))
+            return j, meta.get("timestamp", "—"), int(meta.get("n_records", 0))
+        except Exception:
+            pass
+    return None, "", 0
+
+
+def salvar_tudo(json_str: str, ts: str, n: int) -> tuple[bool, bool]:
+    """
+    Salva local + GitHub.
+    Retorna (ok_local, ok_github).
+    """
+    # Local (sempre)
+    try:
+        salvar_local(json_str, ts, n)
+        ok_local = True
+    except Exception:
+        ok_local = False
+
+    # GitHub (se configurado)
+    token, _, _ = gh_cfg()
+    ok_gh = False
+    if token:
+        ts_commit = datetime.now().strftime("%Y-%m-%d %H:%M")
+        ok_gh = gh_salvar(
+            "data/dados_salvos.json", json_str,
+            f"SMQ_RS: {n} registros — {ts_commit}",
+        )
+        if ok_gh:
+            meta_str = json.dumps({"timestamp": ts, "n_records": n})
+            gh_salvar("data/meta.json", meta_str, f"SMQ_RS: meta — {ts_commit}")
+
+    return ok_local, ok_gh
+
+
+def carregar_tudo() -> tuple[str | None, str, int, str]:
+    """
+    Carrega dados: GitHub → local → nenhum.
+    Retorna (json_str, ts, n, origem).
+    """
+    token, _, _ = gh_cfg()
+    if token:
+        j, _   = gh_ler("data/dados_salvos.json")
+        m_str, _ = gh_ler("data/meta.json")
+        if j and m_str:
+            try:
+                meta = json.loads(m_str)
+                # atualiza cache local
+                salvar_local(j, meta.get("timestamp","—"), int(meta.get("n_records",0)))
+                return j, meta.get("timestamp","—"), int(meta.get("n_records",0)), "github"
+            except Exception:
+                pass
+
+    j, ts, n = carregar_local()
+    if j:
+        return j, ts, n, "local"
+
+    return None, "", 0, "original"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -66,7 +231,7 @@ def xlsx_para_json(file_bytes: bytes) -> tuple[str | None, int, str]:
 
         if not c_cod:
             return None, 0, (
-                f"Coluna 'Código' não encontrada. "
+                "Coluna 'Código' não encontrada. "
                 f"Colunas detectadas: {', '.join(df.columns.tolist())}"
             )
 
@@ -100,13 +265,13 @@ def xlsx_para_json(file_bytes: bytes) -> tuple[str | None, int, str]:
                 return str(v).strip() if pd.notna(v) and str(v) != "nan" else ""
 
             registros.append({
-                "codigo": cod,            "titulo": safe(c_tit),
-                "status": safe(c_st),     "situacao": safe(c_sit),
-                "data": dt_str,           "ano": ano,  "mes": mes,
+                "codigo": cod,          "titulo": safe(c_tit),
+                "status": safe(c_st),   "situacao": safe(c_sit),
+                "data": dt_str,         "ano": ano, "mes": mes,
                 "responsavel": safe(c_rsp),
                 "cliente": safe(c_cli),
                 "responsavel_causa": safe(c_rca),
-                "motivo": safe(c_mot),    "qtd": safe(c_qtd),
+                "motivo": safe(c_mot),  "qtd": safe(c_qtd),
                 "turno": turno,
             })
 
@@ -120,31 +285,7 @@ def xlsx_para_json(file_bytes: bytes) -> tuple[str | None, int, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERSISTÊNCIA — salvar e carregar do disco
-# ══════════════════════════════════════════════════════════════════════════════
-
-def salvar_disco(json_str: str, ts: str, n: int) -> None:
-    LOCAL_JSON.write_text(json_str, encoding="utf-8")
-    LOCAL_META.write_text(
-        json.dumps({"timestamp": ts, "n_records": n}),
-        encoding="utf-8",
-    )
-
-
-def carregar_disco() -> tuple[str | None, str, int]:
-    """Lê dados salvos. Retorna (json_str, timestamp, n) ou (None,'',0)."""
-    if LOCAL_JSON.exists() and LOCAL_META.exists():
-        try:
-            j    = LOCAL_JSON.read_text(encoding="utf-8")
-            meta = json.loads(LOCAL_META.read_text(encoding="utf-8"))
-            return j, meta.get("timestamp", "—"), int(meta.get("n_records", 0))
-        except Exception:
-            pass
-    return None, "", 0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# INJEÇÃO NO HTML
+# HTML
 # ══════════════════════════════════════════════════════════════════════════════
 
 _RE = re.compile(r"const RAW_DATA = \[.*?\];", re.DOTALL)
@@ -162,14 +303,17 @@ def montar_html(json_str: str, ts: str, n: int) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INICIALIZAÇÃO — carrega dados salvos uma única vez por sessão
+# INICIALIZAÇÃO
 # ══════════════════════════════════════════════════════════════════════════════
 
-if "dados" not in st.session_state:
-    j, ts, n = carregar_disco()
-    st.session_state["dados"] = j
-    st.session_state["ts"]    = ts
-    st.session_state["n"]     = n
+if "init" not in st.session_state:
+    st.session_state["init"] = True
+    with st.spinner("Carregando dados..."):
+        j, ts, n, origem = carregar_tudo()
+    st.session_state.update({
+        "json": j, "ts": ts, "n": n,
+        "origem": origem, "log": [],
+    })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -182,12 +326,36 @@ with st.sidebar:
     st.divider()
 
     # Status
-    if st.session_state["dados"]:
-        st.success("✅ Dados carregados")
+    origem = st.session_state.get("origem", "original")
+    if origem == "github":
+        st.success("☁️ **Dados sincronizados com GitHub**")
+    elif origem == "local":
+        st.warning("💾 **Cache local** (GitHub offline ou não configurado)")
+    else:
+        st.info("📋 Dados originais do sistema")
+
+    if st.session_state.get("ts"):
         st.caption(f"🕐 {st.session_state['ts']}")
         st.caption(f"📋 {st.session_state['n']:,} registros")
+
+    st.divider()
+
+    # GitHub status (informativo, sem botão de teste)
+    token, repo, branch = gh_cfg()
+    if token:
+        st.success(f"☁️ **GitHub configurado**\n\n`{repo}` · `{branch}`")
     else:
-        st.info("📋 Usando dados originais do sistema")
+        st.warning(
+            "⚠️ **GitHub não configurado**\n\n"
+            "Dados persistem apenas na sessão atual.\n\n"
+            "Configure em **Settings → Secrets**:\n"
+            "```toml\n"
+            "[github]\n"
+            "token  = \"ghp_...\"\n"
+            "repo   = \"usuario/smq_rs\"\n"
+            "branch = \"main\"\n"
+            "```"
+        )
 
     st.divider()
     st.markdown("### 📂 Atualizar Planilha")
@@ -195,49 +363,75 @@ with st.sidebar:
     arquivo = st.file_uploader(
         "Selecione o arquivo .xlsx",
         type=["xlsx", "xls"],
+        help="Mesmo formato da planilha Consultas_RNC_APP.xlsx",
     )
 
     if arquivo:
-        if st.button("⬆️ Salvar Planilha", type="primary",
+        if st.button("⬆️ Processar e Salvar", type="primary",
                      use_container_width=True):
-            with st.spinner("Processando..."):
+            log = []
+            ts  = datetime.now().strftime("%d/%m/%Y às %H:%M")
+
+            with st.spinner("Lendo planilha..."):
                 j, n, erro = xlsx_para_json(arquivo.read())
 
             if not j:
                 st.error(f"❌ {erro}")
             else:
-                ts = datetime.now().strftime("%d/%m/%Y às %H:%M")
-                try:
-                    salvar_disco(j, ts, n)
-                    st.session_state["dados"] = j
-                    st.session_state["ts"]    = ts
-                    st.session_state["n"]     = n
-                    st.success(f"✅ {n:,} registros salvos!\n\n🕐 {ts}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Erro ao salvar: {e}")
+                log.append(f"✅ {n:,} registros lidos")
+
+                with st.spinner("Salvando..."):
+                    ok_local, ok_gh = salvar_tudo(j, ts, n)
+
+                if ok_local:
+                    log.append("✅ Cache local: salvo")
+                else:
+                    log.append("⚠️ Cache local: falhou")
+
+                if token:
+                    if ok_gh:
+                        log.append("✅ GitHub: salvo com sucesso")
+                    else:
+                        log.append(
+                            "❌ GitHub: falha ao salvar\n"
+                            "   Verifique token e nome do repositório."
+                        )
+                else:
+                    log.append("ℹ️ GitHub: não configurado")
+
+                st.session_state.update({
+                    "json": j, "ts": ts, "n": n,
+                    "origem": "github" if ok_gh else "local",
+                    "log": log,
+                })
+                st.rerun()
+
+    # Log
+    if st.session_state.get("log"):
+        st.divider()
+        st.markdown("**Resultado:**")
+        for linha in st.session_state["log"]:
+            st.caption(linha)
 
     st.divider()
 
-    if LOCAL_JSON.exists():
-        if st.button("🗑️ Limpar dados salvos", type="secondary"):
-            LOCAL_JSON.unlink(missing_ok=True)
-            LOCAL_META.unlink(missing_ok=True)
-            st.session_state["dados"] = None
-            st.session_state["ts"]    = ""
-            st.session_state["n"]     = 0
-            st.rerun()
+    if st.button("🗑️ Limpar dados salvos", type="secondary"):
+        LOCAL_JSON.unlink(missing_ok=True)
+        LOCAL_META.unlink(missing_ok=True)
+        for k in ("json","ts","n","origem","log","init"):
+            st.session_state.pop(k, None)
+        st.rerun()
 
-    st.caption("SMQ_RS v1.5 · Streamlit + Chart.js")
+    st.caption("SMQ_RS v1.4 · Streamlit + Chart.js")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
-if st.session_state.get("dados"):
+if st.session_state.get("json"):
     html = montar_html(
-        st.session_state["dados"],
+        st.session_state["json"],
         st.session_state["ts"],
         st.session_state["n"],
     )
