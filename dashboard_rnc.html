@@ -234,8 +234,10 @@
       <select id="f-motivo" multiple size="5" style="min-width:200px;"></select>
     </div>
     <div class="filter-group">
-      <div class="filter-label">Responsável (Análise)</div>
-      <select id="f-resp" style="min-width:160px;"><option value="">Todos</option></select>
+      <div class="filter-label">Responsável (Análise) <span style="color:var(--text3);font-size:9px">Ctrl+clique · ⊕ Todos</span></div>
+      <button class="todos-btn" onclick="selecionarTodos('f-resp')" title="Selecionar todos">⊕ Todos</button>
+      <button class="todos-btn" onclick="limparSelect('f-resp')" title="Desmarcar todos" style="color:var(--text3)">⊖ Nenhum</button>
+      <select id="f-resp" multiple size="5" style="min-width:160px;"></select>
     </div>
     <div style="display:flex;flex-direction:column;gap:6px;padding-top:16px;">
       <button class="apply-btn" onclick="aplicarFiltros()">Aplicar</button>
@@ -281,7 +283,7 @@
       <div style="position:relative;height:260px;"><canvas id="visao-pizza-validas"></canvas></div>
     </div>
     <div class="chart-card">
-      <div class="chart-title">Distribuição por Turno (total)</div>
+      <div class="chart-title">Distribuição por Turno (válidas)</div>
       <div style="position:relative;height:260px;"><canvas id="visao-pizza-turno"></canvas></div>
     </div>
   </div>
@@ -426,7 +428,7 @@ function getFilters(){
     turnos  : getMulti('f-turno'),
     clientes: getMulti('f-cliente'),
     motivos : getMulti('f-motivo'),
-    resp    : document.getElementById('f-resp').value,
+    resps   : getMulti('f-resp'),
   };
 }
 function applyFilters(f){
@@ -439,7 +441,7 @@ function applyFilters(f){
     if(f.turnos.length  &&!f.turnos.includes(x.turno))     return false;
     if(f.clientes.length&&!f.clientes.includes(x.cliente)) return false;
     if(f.motivos.length &&!f.motivos.includes(x.motivo))   return false;
-    if(f.resp           &&x.responsavel_causa!==f.resp)    return false;
+    if(f.resps&&f.resps.length&&!f.resps.includes(x.responsavel_causa)) return false;
     return true;
   });
 }
@@ -456,13 +458,12 @@ function populateSelects(){
   document.getElementById('f-turno').innerHTML  =turnos.map(opt).join('');
   document.getElementById('f-cliente').innerHTML=clientes.map(opt).join('');
   document.getElementById('f-motivo').innerHTML =motivos.map(opt).join('');
-  document.getElementById('f-resp').innerHTML   ='<option value="">Todos</option>'+resps.map(opt).join('');
+  document.getElementById('f-resp').innerHTML   =resps.map(opt).join('');
 }
 
 // ── LIMPAR FILTROS ────────────────────────────────────────────────────────────
 function limparFiltros(){
-  ['f-status','f-turno','f-cliente','f-motivo'].forEach(id=>limparSelect(id));
-  document.getElementById('f-resp').value='';
+  ['f-status','f-turno','f-cliente','f-motivo','f-resp'].forEach(id=>limparSelect(id));
   renderAtivo();
 }
 
@@ -595,7 +596,8 @@ function renderVisao(){
         tooltip:{callbacks:{label:c=>`${c.label}: ${c.parsed} (${Math.round(c.parsed/total*100)}%)`}}}}
   });
 
-  const byTurno=countBy(d.filter(x=>x.turno),'turno');
+  const dVT=validosGraf(d);
+  const byTurno=countBy(dVT.filter(x=>x.turno),'turno');
   destroyChart('visao-pizza-turno');
   charts['visao-pizza-turno']=new Chart(document.getElementById('visao-pizza-turno'),{
     type:'pie',
@@ -735,7 +737,7 @@ function getIntervalData(fromId, toId){
     if(f.turnos.length  &&!f.turnos.includes(x.turno))     return false;
     if(f.clientes.length&&!f.clientes.includes(x.cliente)) return false;
     if(f.motivos.length &&!f.motivos.includes(x.motivo))   return false;
-    if(f.resp           &&x.responsavel_causa!==f.resp)    return false;
+    if(f.resps&&f.resps.length&&!f.resps.includes(x.responsavel_causa)) return false;
     return true;
   });
 }
@@ -936,7 +938,7 @@ function renderResponsavel(){
               y:{ticks:{color:'#e8ecf4',font:{size:10}}}}}
   });
 
-  const top5Resp=sorted.slice(0,5).map(([r])=>r);
+  const top5Resp=sorted.slice(0,10).map(([r])=>r);
   let html='';
   top5Resp.forEach(resp=>{
     const dd=dG.filter(x=>x.responsavel_causa===resp);
@@ -964,7 +966,7 @@ function statusBadge(s){
 function renderTabela(){
   const f=getFilters();
   const d=applyFilters(f);
-  const ativos=[f.statuses.length,f.turnos.length,f.clientes.length,f.motivos.length,f.resp?1:0].filter(Boolean).length;
+  const ativos=[f.statuses.length,f.turnos.length,f.clientes.length,f.motivos.length,(f.resps&&f.resps.length)?1:0].filter(Boolean).length;
   document.getElementById('table-count').textContent=`${d.length} registros${ativos?` · ${ativos} filtro(s) ativo(s)`:''}`;
   document.getElementById('table-body').innerHTML=d.slice(0,300).map(r=>`
     <tr>
